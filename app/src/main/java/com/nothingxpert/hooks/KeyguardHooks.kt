@@ -414,7 +414,7 @@ class KeyguardHooks : BaseHook() {
             )
         }
     }
-    
+
     private fun goToSleepFromInteractor(instance: Any): Boolean {
         return try {
             val powerManager = XposedHelpers.getObjectField(instance, "powerManager") as? PowerManager
@@ -546,7 +546,7 @@ class KeyguardHooks : BaseHook() {
             (base * 3).coerceAtLeast(DOUBLE_TAP_WAKE_SLOP_PX)
         } catch (_: Throwable) { DOUBLE_TAP_WAKE_SLOP_PX }
     }
-    
+
     private fun isSingleTapEnabled() = getPreferenceBoolean(PREF_SINGLE_TAP, false)
     private fun isShufflePinEnabled() = getPreferenceBoolean(PREF_SHUFFLE_PIN, false)
     private fun isDoubleTapWakeEnabled() = getPreferenceBoolean(PREF_DOUBLE_TAP_WAKE, false)

@@ -24,6 +24,7 @@ import com.nothing.ketchum.GlyphManager
 import com.nothingxpert.util.RootShell
 import java.time.DayOfWeek
 import java.time.LocalTime
+import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
@@ -49,6 +50,9 @@ class GlyphNotificationService : NotificationListenerService() {
         private const val GLYPH_BEDTIME_START = "led_bed_time_custom_start_time"
         private const val GLYPH_BEDTIME_END = "led_bed_time_custom_end_time"
         private const val GLYPH_BEDTIME_WEEK = "led_bed_time_custom_week"
+
+        private val ESSENTIAL_PACKAGE_REGEX =
+            Regex("""AppSettings:\s+([A-Za-z0-9._]+)\s+\([0-9]+\).*?\bessential=true\b""")
 
         // Phone (1) channel constants.
         private const val CH_P1_A1 = 0
@@ -83,11 +87,24 @@ class GlyphNotificationService : NotificationListenerService() {
     }
 
     private var glyphManager: GlyphManager? = null
-    private var isSessionOpen = false
-    private var isServiceConnected = false
-    private var isGlyphSdkAuthorized = false
+    @Volatile private var isSessionOpen = false
+    @Volatile private var isServiceConnected = false
+    @Volatile private var isGlyphSdkAuthorized = false
+
+    // Phone (1) sysfs fallback. Only used when the Ketchum SDK can't drive the LEDs
+    // (e.g. running as a regular user app on Phone (1) where the SDK requires
+    // platform-signed/system_app caller). Phone (2) stays on the SDK path.
+    @Volatile private var sysfsFallbackReady = false
+    @Volatile private var sysfsFallbackActive = false
     private val handler = Handler(Looper.getMainLooper())
     private lateinit var prefs: SharedPreferences
+
+    // Single-threaded executor that serializes all blocking glyph work (root shell calls,
+    // SDK session toggles, frame builds). Keeps the main thread free of ANRs and avoids
+    // racing between concurrent refreshGlyphs() callers.
+    private val glyphExecutor = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "GlyphNotif-Worker").apply { isDaemon = true }
+    }
 
     // Track active notification keys → their glyph zones
     // When all are dismissed, glyphs turn off
@@ -102,7 +119,7 @@ class GlyphNotificationService : NotificationListenerService() {
     private var mappingsCache: Map<String, Set<String>>? = null
 
     // Package label cache used for substitute app-name fallback matching.
-    private val appLabelCache = mutableMapOf<String, String>()
+    private val appLabelCache = java.util.concurrent.ConcurrentHashMap<String, String>()
 
     // Temporary zones previewed from the picker dialog.
     @Volatile
@@ -138,6 +155,18 @@ class GlyphNotificationService : NotificationListenerService() {
                 Intent.ACTION_TIME_TICK,
                 Intent.ACTION_TIME_CHANGED,
                 Intent.ACTION_TIMEZONE_CHANGED -> refreshGlyphs()
+            }
+        }
+    }
+    private val screenStateReceiver = object : android.content.BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            when (intent?.action) {
+                Intent.ACTION_SCREEN_OFF,
+                Intent.ACTION_SCREEN_ON,
+                Intent.ACTION_USER_PRESENT -> {
+                    Log.d(TAG, "Screen state changed: action=${intent.action}; forcing glyph refresh")
+                    refreshGlyphs()
+                }
             }
         }
     }
@@ -183,6 +212,8 @@ class GlyphNotificationService : NotificationListenerService() {
 
         // Initialize Glyph SDK
         initGlyphManager()
+        // Probe sysfs LED driver in the background (Phone (1) only).
+        initSysfsFallbackAsync()
         registerBedtimeObservers()
 
         refreshEssentialPackagesAsync(force = true)
@@ -197,8 +228,10 @@ class GlyphNotificationService : NotificationListenerService() {
         try {
             prefs.unregisterOnSharedPreferenceChangeListener(prefChangeListener)
         } catch (_: Exception) {}
-        activeNotifications.clear()
-        activeEssentialNotifications.clear()
+        synchronized(activeNotifications) {
+            activeNotifications.clear()
+            activeEssentialNotifications.clear()
+        }
         manualPreviewZones = null
         unregisterBedtimeObservers()
         closeGlyphSession()
@@ -207,6 +240,9 @@ class GlyphNotificationService : NotificationListenerService() {
         if (instance === this) {
             instance = null
         }
+        try {
+            glyphExecutor.shutdown()
+        } catch (_: Exception) {}
         super.onDestroy()
     }
 
@@ -228,14 +264,21 @@ class GlyphNotificationService : NotificationListenerService() {
             bedtimeSettingUris.forEach { uri ->
                 contentResolver.registerContentObserver(uri, false, bedtimeSettingsObserver)
             }
-            val filter = IntentFilter().apply {
+            val timeFilter = IntentFilter().apply {
                 addAction(Intent.ACTION_TIME_TICK)
                 addAction(Intent.ACTION_TIME_CHANGED)
                 addAction(Intent.ACTION_TIMEZONE_CHANGED)
             }
-            registerReceiver(timeTickReceiver, filter)
+            registerReceiver(timeTickReceiver, timeFilter)
+
+            val screenFilter = IntentFilter().apply {
+                addAction(Intent.ACTION_SCREEN_OFF)
+                addAction(Intent.ACTION_SCREEN_ON)
+                addAction(Intent.ACTION_USER_PRESENT)
+            }
+            registerReceiver(screenStateReceiver, screenFilter)
         } catch (e: Exception) {
-            Log.w(TAG, "Failed to register bedtime observers: ${e.message}")
+            Log.w(TAG, "Failed to register bedtime/screen observers: ${e.message}")
         }
     }
 
@@ -245,6 +288,9 @@ class GlyphNotificationService : NotificationListenerService() {
         } catch (_: Exception) {}
         try {
             unregisterReceiver(timeTickReceiver)
+        } catch (_: Exception) {}
+        try {
+            unregisterReceiver(screenStateReceiver)
         } catch (_: Exception) {}
     }
 
@@ -263,6 +309,14 @@ class GlyphNotificationService : NotificationListenerService() {
         }.start()
     }
 
+    private fun initSysfsFallbackAsync() {
+        if (!GlyphsActivity.isPhone1()) return
+        glyphExecutor.execute {
+            sysfsFallbackReady = SysfsGlyphController.init()
+            Log.d(TAG, "Sysfs fallback ready=$sysfsFallbackReady")
+        }
+    }
+
     private fun initGlyphManager() {
         try {
             glyphManager = GlyphManager.getInstance(applicationContext)
@@ -270,7 +324,6 @@ class GlyphNotificationService : NotificationListenerService() {
                 override fun onServiceConnected(componentName: ComponentName?) {
                     Log.d(TAG, "GlyphManager service connected")
                     isServiceConnected = true
-                    registerDevice()
                     refreshGlyphs()
                 }
 
@@ -286,9 +339,9 @@ class GlyphNotificationService : NotificationListenerService() {
         }
     }
 
-    private fun registerDevice() {
+    private fun registerDevice(): Boolean {
         try {
-            val gm = glyphManager ?: return
+            val gm = glyphManager ?: return false
             val targetDevice = when {
                 Common.is20111() -> Glyph.DEVICE_20111
                 Common.is22111() -> Glyph.DEVICE_22111
@@ -307,7 +360,7 @@ class GlyphNotificationService : NotificationListenerService() {
             if (targetDevice == null) {
                 isGlyphSdkAuthorized = false
                 Log.w(TAG, "Unknown device for Glyph registration: model=${Build.MODEL} device=${Build.DEVICE}")
-                return
+                return false
             }
 
             isGlyphSdkAuthorized = gm.register(targetDevice)
@@ -315,9 +368,11 @@ class GlyphNotificationService : NotificationListenerService() {
                 TAG,
                 "Glyph SDK register result: authorized=$isGlyphSdkAuthorized target=$targetDevice model=${Build.MODEL} device=${Build.DEVICE}"
             )
+            return isGlyphSdkAuthorized
         } catch (e: Exception) {
             isGlyphSdkAuthorized = false
             Log.e(TAG, "Failed to register device: ${e.message}")
+            return false
         }
     }
 
@@ -433,15 +488,20 @@ class GlyphNotificationService : NotificationListenerService() {
 
         val zones = resolved.second
 
-        // Track this notification
+        // Track this notification.
+        val essentialEmpty: Boolean
         synchronized(activeNotifications) {
             activeNotifications[key] = zones
+            essentialEmpty = activeEssentialNotifications.isEmpty()
         }
 
         // If we missed an Essential post event (e.g., arrived while screen was on before tracking),
         // recover currently active Essential notifications from the system snapshot.
-        if (activeEssentialNotifications.isEmpty()) {
-            syncActiveEssentialNotificationsFromSystem()
+        // Dispatched to the glyph executor; the eventual refreshGlyphs() will reflect it.
+        if (essentialEmpty) {
+            try {
+                glyphExecutor.execute { syncActiveEssentialNotificationsFromSystem() }
+            } catch (_: Exception) {}
         }
 
         // Activate glyphs with all currently active zones merged
@@ -476,9 +536,27 @@ class GlyphNotificationService : NotificationListenerService() {
     /**
      * Rebuild glyph frame from active mapped notifications.
      * Essential notifications are represented as a fixed indicator overlay (B1 / CAMERA).
+     *
+     * Always dispatched to [glyphExecutor] because it performs blocking root shell calls
+     * and Glyph SDK operations that must not run on the main thread.
      */
     private fun refreshGlyphs() {
-        syncActiveEssentialNotificationsFromSystem()
+        try {
+            glyphExecutor.execute { refreshGlyphsBlocking() }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to dispatch refreshGlyphs: ${e.message}")
+        }
+    }
+
+    private fun refreshGlyphsBlocking() {
+        // Skip expensive Essential notification sync when only showing a picker preview
+        // with no real notifications tracked — avoids blocking root calls for a UI-only action.
+        val previewOnly = manualPreviewZones != null && synchronized(activeNotifications) {
+            activeNotifications.isEmpty() && activeEssentialNotifications.isEmpty()
+        }
+        if (!previewOnly) {
+            syncActiveEssentialNotificationsFromSystem()
+        }
 
         val allZones: Set<String>
         synchronized(activeNotifications) {
@@ -666,14 +744,9 @@ class GlyphNotificationService : NotificationListenerService() {
         return "CAMERA"
     }
 
-    private fun waitForEssentialRefreshInFlight(maxWaitMs: Long) {
-        if (!essentialRefreshInFlight.get()) return
-
-        val deadline = SystemClock.elapsedRealtime() + maxWaitMs
-        while (essentialRefreshInFlight.get() && SystemClock.elapsedRealtime() < deadline) {
-            SystemClock.sleep(50L)
-        }
-    }
+    // NOOP: previously blocked the main thread waiting for a background root shell call,
+    // causing ANRs. The in-flight async refresh will populate essentialPackages when done.
+    private fun waitForEssentialRefreshInFlight(maxWaitMs: Long) {}
 
     private fun refreshEssentialPackagesSync(timeoutMs: Long = ESSENTIAL_SYNC_REFRESH_TIMEOUT_MS): Boolean {
         if (!essentialRefreshInFlight.compareAndSet(false, true)) return false
@@ -753,11 +826,10 @@ class GlyphNotificationService : NotificationListenerService() {
     private fun parseEssentialPackages(raw: String): Set<String> {
         if (raw.isBlank()) return emptySet()
 
-        val regex = Regex("""AppSettings:\s+([A-Za-z0-9._]+)\s+\([0-9]+\).*?\bessential=true\b""")
         val result = linkedSetOf<String>()
 
         for (line in raw.lineSequence()) {
-            val pkg = regex.find(line)?.groupValues?.getOrNull(1)
+            val pkg = ESSENTIAL_PACKAGE_REGEX.find(line)?.groupValues?.getOrNull(1)
             if (!pkg.isNullOrBlank()) result.add(pkg)
         }
 
@@ -771,7 +843,24 @@ class GlyphNotificationService : NotificationListenerService() {
             null
         } ?: return
 
+        val snapshotKeys = linkedSetOf<String>()
+        for (sbn in sbns) {
+            val key = sbn.key
+            if (!key.isNullOrBlank()) snapshotKeys.add(key)
+        }
+
+        val previouslyTrackedEssential = synchronized(activeNotifications) {
+            activeEssentialNotifications.toSet()
+        }
+
         val essentialKeys = linkedSetOf<String>()
+
+        // Preserve already-tracked Essential keys if they are still present in the active
+        // notification snapshot. Some Nothing Essential notifications can no longer be
+        // resolved back to their originating package when read via getActiveNotifications(),
+        // but their notification key still remains stable until the notification is truly gone.
+        essentialKeys.addAll(previouslyTrackedEssential.filter { it in snapshotKeys })
+
         for (sbn in sbns) {
             val resolved = resolveMappedZones(sbn) ?: continue
             if (isEssentialPackage(resolved.first)) {
@@ -785,9 +874,10 @@ class GlyphNotificationService : NotificationListenerService() {
             activeEssentialNotifications.addAll(essentialKeys)
         }
 
-        if (essentialKeys.isNotEmpty()) {
-            Log.d(TAG, "Synced active essential notifications: ${essentialKeys.size}")
-        }
+        Log.d(
+            TAG,
+            "Synced active essential notifications: ${essentialKeys.size} keys=$essentialKeys snapshot=$snapshotKeys preserved=${previouslyTrackedEssential.intersect(snapshotKeys)}"
+        )
     }
 
     private fun resolveAppLabel(packageName: String): String? {
@@ -832,39 +922,81 @@ class GlyphNotificationService : NotificationListenerService() {
     }
 
     private fun activateGlyphs(zones: Set<String>) {
-        val gm = glyphManager ?: return
-        if (!isServiceConnected) return
-        if (!isGlyphSdkAuthorized) {
-            Log.w(TAG, "Skip glyph activation because SDK register failed: zones=$zones")
-            return
-        }
+        val physicalPhone1 = GlyphsActivity.isPhone1()
+        val gm = glyphManager
 
-        if (!isSessionOpen) {
-            enableDebugModeSync()
-            openGlyphSession()
-        }
-        if (!isSessionOpen) return
-
-        try {
-            val builder = gm.glyphFrameBuilder
-            if (builder == null) {
-                Log.w(TAG, "Glyph frame builder unavailable")
-                return
+        // Try the Ketchum SDK path first.
+        if (gm != null && isServiceConnected) {
+            if (!isSessionOpen) {
+                Log.d(TAG, "Preparing Glyph SDK authorization for activation: zones=$zones")
+                enableDebugModeSync()
+                if (registerDevice()) {
+                    openGlyphSession()
+                } else {
+                    Log.w(TAG, "SDK register failed; will try sysfs fallback if available: zones=$zones")
+                }
             }
-            val isPhone1 = resolvePhone1ChannelMode()
-
-            for (zone in zones) {
-                buildChannelsForZone(builder, zone, isPhone1)
+            if (isGlyphSdkAuthorized && isSessionOpen) {
+                try {
+                    val builder = gm.glyphFrameBuilder
+                    if (builder != null) {
+                        val isPhone1Channels = resolvePhone1ChannelMode()
+                        for (zone in zones) {
+                            buildChannelsForZone(builder, zone, isPhone1Channels)
+                        }
+                        gm.toggle(builder.build())
+                        Log.d(TAG, "Glyphs activated via SDK for zones: $zones")
+                        return
+                    }
+                    Log.w(TAG, "Glyph frame builder unavailable")
+                } catch (e: Exception) {
+                    Log.e(TAG, "SDK activation failed, will try sysfs fallback: ${e.message}")
+                }
+            } else {
+                Log.w(
+                    TAG,
+                    "Glyph SDK session unavailable: authorized=$isGlyphSdkAuthorized open=$isSessionOpen zones=$zones"
+                )
             }
-
-            val frame = builder.build()
-
-            gm.toggle(frame)
-
-            Log.d(TAG, "Glyphs activated for zones: $zones")
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to activate glyphs: ${e.message}")
         }
+
+        // Sysfs fallback (Phone (1) only).
+        if (physicalPhone1 && sysfsFallbackReady) {
+            try {
+                val zoneFlags = zonesToPhone1Flags(zones)
+                if (!zoneFlags.any { it }) {
+                    Log.d(TAG, "No Phone(1) zones resolved from $zones; skipping sysfs write")
+                    return
+                }
+                SysfsGlyphController.activateZones(zoneFlags)
+                sysfsFallbackActive = true
+                Log.d(TAG, "Glyphs activated via sysfs for zones: $zones")
+            } catch (e: Exception) {
+                Log.e(TAG, "Sysfs activation failed: ${e.message}")
+            }
+        } else if (gm == null || !isServiceConnected) {
+            Log.w(TAG, "Skip glyph activation: SDK unavailable and no sysfs fallback. zones=$zones")
+        }
+    }
+
+    /**
+     * Map user-facing Phone (1) zone names to the 5-element boolean array
+     * SysfsGlyphController.activateZones() expects.
+     * Index: 0=A1 Camera, 1=B1 Diagonal, 2=C1-C4 Battery, 3=D1 Center, 4=E1 Bottom.
+     */
+    private fun zonesToPhone1Flags(zones: Set<String>): BooleanArray {
+        val flags = BooleanArray(SysfsGlyphController.PHONE1_ZONE_COUNT)
+        for (zone in zones) {
+            when (zone) {
+                "CAMERA" -> flags[0] = true
+                "DIAGONAL" -> flags[1] = true
+                "BATTERY" -> flags[2] = true
+                "CENTER" -> flags[3] = true
+                "BOTTOM" -> flags[4] = true
+                else -> Log.w(TAG, "Unknown Phone(1) zone for sysfs fallback: $zone")
+            }
+        }
+        return flags
     }
 
     private fun resolvePhone1ChannelMode(): Boolean {
@@ -943,16 +1075,29 @@ class GlyphNotificationService : NotificationListenerService() {
             // can acquire the Glyph session.
             closeGlyphSession()
         }
+        if (sysfsFallbackActive) {
+            try {
+                SysfsGlyphController.turnOff()
+                Log.d(TAG, "Sysfs glyphs turned off")
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to turn off sysfs glyphs: ${e.message}")
+            } finally {
+                sysfsFallbackActive = false
+            }
+        }
     }
 
     override fun onListenerConnected() {
         super.onListenerConnected()
         Log.d(TAG, "Notification listener connected")
         invalidateMappingsCache()
-        handler.post {
-            suppressExistingKetchumNotifications()
-            syncActiveEssentialNotificationsFromSystem()
-            refreshGlyphs()
+        try {
+            glyphExecutor.execute {
+                suppressExistingKetchumNotifications()
+                refreshGlyphsBlocking()
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to dispatch onListenerConnected work: ${e.message}")
         }
     }
 
@@ -964,6 +1109,10 @@ class GlyphNotificationService : NotificationListenerService() {
             activeEssentialNotifications.clear()
         }
         manualPreviewZones = null
-        turnOffGlyphs()
+        try {
+            glyphExecutor.execute { turnOffGlyphs() }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to dispatch turnOffGlyphs: ${e.message}")
+        }
     }
 }
